@@ -47,9 +47,13 @@ type Link struct {
 	URL  string `json:"url"`
 }
 
-// Topic identifies a user's topic in the group: the root (card) message and,
-// once known, the thread id 飞书 assigned to it.
+// Topic identifies a user's topic: the group it lives in, its root (card)
+// message and, once known, the thread id 飞书 assigned to it.
 type Topic struct {
+	// Group is the 飞书 chat id. When the backend is pointed at another
+	// group (the app was reconnected), topics in the old group are
+	// abandoned and each user gets a new topic with their next message.
+	Group         string
 	RootMessageID string
 	ThreadID      string
 }
@@ -60,6 +64,7 @@ type Conversation struct {
 	ID            string
 	UserID        string
 	UserName      string
+	TopicGroup    string
 	RootMessageID string
 	ThreadID      string
 	LastMessageAt time.Time
@@ -72,7 +77,7 @@ type Conversation struct {
 
 // Topic returns the conversation's topic.
 func (c *Conversation) Topic() Topic {
-	return Topic{RootMessageID: c.RootMessageID, ThreadID: c.ThreadID}
+	return Topic{Group: c.TopicGroup, RootMessageID: c.RootMessageID, ThreadID: c.ThreadID}
 }
 
 // Sender says who wrote a message.

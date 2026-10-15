@@ -86,7 +86,7 @@ func runInit(ctx context.Context, c initConfig, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	bot, err := waitForBot(ctx, client, c.botWait)
+	bot, err := client.WaitReady(ctx, c.botWait)
 	if err != nil {
 		return fmt.Errorf("%w\n应用的机器人能力还不可用：在 %s 打开「机器人」能力并发布版本，然后运行 feishu-livechat setup -name %s",
 			err, consoleURL(reg), c.groupName)
@@ -119,26 +119,6 @@ func runInit(ctx context.Context, c initConfig, out io.Writer) error {
 	fmt.Fprintf(out, "⑤ 配置已写入 %s。启动服务：\n\n   feishu-livechat serve\n\n", c.envFile)
 	fmt.Fprintln(out, "   本地试用：LIVECHAT_DEMO=1 feishu-livechat serve，再用 feishu-livechat token -user u1 -name 测试用户 生成 token，打开 http://localhost:8080/")
 	return nil
-}
-
-// waitForBot polls the bot info until the new app's bot is live: right
-// after creation it can take a moment.
-func waitForBot(ctx context.Context, c *feishu.Client, wait time.Duration) (feishu.BotInfo, error) {
-	deadline := time.Now().Add(wait)
-	for {
-		bot, err := c.Bot(ctx)
-		if err == nil {
-			return bot, nil
-		}
-		if time.Now().After(deadline) {
-			return feishu.BotInfo{}, err
-		}
-		select {
-		case <-ctx.Done():
-			return feishu.BotInfo{}, ctx.Err()
-		case <-time.After(3 * time.Second):
-		}
-	}
 }
 
 func consoleURL(r feishu.Registration) string {

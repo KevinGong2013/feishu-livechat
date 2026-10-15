@@ -23,6 +23,8 @@ var (
 	ErrTooLarge = errors.New("livechat: image too large")
 	// ErrRateLimited: the user sent more than Config.MaxMessagesPerMinute.
 	ErrRateLimited = errors.New("livechat: too many messages")
+	// ErrUnavailable: the backend has no app connected yet.
+	ErrUnavailable = errors.New("livechat: support chat is not set up")
 	// ErrUnknownTopic: an agent replied in a topic that belongs to no
 	// conversation (a topic someone started by hand, or one replaced after
 	// its root card was deleted). The reply is ignored.
@@ -99,6 +101,9 @@ func (b *Bridge) SendText(ctx context.Context, u User, text string) (*Message, e
 	if utf8.RuneCountInString(text) > b.cfg.MaxTextRunes {
 		return nil, ErrTooLong
 	}
+	if !b.Available() {
+		return nil, ErrUnavailable
+	}
 	if !b.rate.allow(u.ID) {
 		return nil, ErrRateLimited
 	}
@@ -126,6 +131,9 @@ func (b *Bridge) SendImage(ctx context.Context, u User, data []byte) (*Message, 
 	img, ext, err := inspectImage(data)
 	if err != nil {
 		return nil, err
+	}
+	if !b.Available() {
+		return nil, ErrUnavailable
 	}
 	if !b.rate.allow(u.ID) {
 		return nil, ErrRateLimited
@@ -206,9 +214,10 @@ func (b *Bridge) postToTopic(ctx context.Context, u User, conv *Conversation, ms
 }
 
 // ensureTopic returns the conversation's topic, creating it when there is
-// none yet or when the current one's root is replaceRoot. It is serialized
-// per conversation in-process; across processes Store.SetTopic's
-// compare-and-set keeps a single winner.
+// none yet, when it lives in a group the backend no longer posts to, or
+// when its root is replaceRoot. It is serialized per conversation
+// in-process; across processes Store.SetTopic's compare-and-set keeps a
+// single winner.
 func (b *Bridge) ensureTopic(ctx context.Context, u User, convID, replaceRoot, dedupeKey string) (Topic, error) {
 	unlock := b.locks.lock(convID)
 	defer unlock()
@@ -217,7 +226,7 @@ func (b *Bridge) ensureTopic(ctx context.Context, u User, convID, replaceRoot, d
 	if err != nil {
 		return Topic{}, err
 	}
-	if cur.RootMessageID != "" && cur.RootMessageID != replaceRoot {
+	if cur.RootMessageID != "" && cur.RootMessageID != replaceRoot && cur.TopicGroup == b.cfg.Backend.Group() {
 		return cur.Topic(), nil
 	}
 	topic, err := b.cfg.Backend.CreateTopic(ctx, u, dedupeKey)
@@ -255,7 +264,9 @@ func (b *Bridge) HandleAgentMessage(ctx context.Context, am AgentMessage) error 
 	if conv.ThreadID == "" && am.ThreadID != "" && conv.RootMessageID == am.RootMessageID {
 		// 飞书 did not return the thread id when the card was posted; learn
 		// it from the first reply.
-		_, _ = b.cfg.Store.SetTopic(ctx, conv.ID, conv.RootMessageID, Topic{RootMessageID: conv.RootMessageID, ThreadID: am.ThreadID})
+		t := conv.Topic()
+		t.ThreadID = am.ThreadID
+		_, _ = b.cfg.Store.SetTopic(ctx, conv.ID, conv.RootMessageID, t)
 	}
 
 	m := newMessage(conv.ID, SenderAgent, StatusSent)
@@ -382,6 +393,15 @@ func (b *Bridge) Unread(ctx context.Context, userID string) (int, error) {
 // the reader falls behind; re-sync with History and subscribe again.
 func (b *Bridge) Subscribe(userID string) (<-chan *Message, func()) {
 	return b.hub.subscribe(userID)
+}
+
+// Available reports whether user messages can be delivered: false while the
+// backend has no app connected (see Availability).
+func (b *Bridge) Available() bool {
+	if a, ok := b.cfg.Backend.(Availability); ok {
+		return a.Available()
+	}
+	return true
 }
 
 // Online reports whether the user has a page subscribed in this process.

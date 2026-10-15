@@ -78,10 +78,21 @@ func (c *Client) Listen(ctx context.Context, sink Sink) error {
 		larkws.WithEventHandler(d),
 		larkws.WithLogLevel(larkcore.LogLevelInfo),
 	}
-	if c.cfg.Lark {
+	switch {
+	case c.cfg.OpenBaseURL != "":
+		opts = append(opts, larkws.WithDomain(c.cfg.OpenBaseURL))
+	case c.cfg.Lark:
 		opts = append(opts, larkws.WithDomain("https://open.larksuite.com"))
 	}
-	return larkws.NewClient(c.cfg.AppID, c.cfg.AppSecret, opts...).Start(ctx)
+	ws := larkws.NewClient(c.cfg.AppID, c.cfg.AppSecret, opts...)
+	if c.onState != nil {
+		ws.SetOnReady(func() { c.onState("connected", nil) })
+		ws.SetOnReconnecting(func() { c.onState("connecting", nil) })
+		ws.SetOnReconnected(func() { c.onState("connected", nil) })
+		ws.SetOnDisconnected(func() { c.onState("disconnected", nil) })
+		ws.SetOnError(func(err error) { c.onState("", err) })
+	}
+	return ws.Start(ctx)
 }
 
 // agentMessage turns a message event into an AgentMessage when it is an

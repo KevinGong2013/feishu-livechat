@@ -44,6 +44,7 @@ type HandlerOptions struct {
 
 // Handler serves the chat API:
 //
+//	GET  /status                           {"available"}: false until an app is connected; hide the chat entry then
 //	GET  /messages?before=&after=&limit=  history, ascending; {"messages", "has_more"}
 //	POST /messages        {"text"}         send text
 //	POST /images          image bytes, or multipart field "file"
@@ -71,6 +72,7 @@ func (b *Bridge) Handler(opts HandlerOptions) http.Handler {
 	h := &handler{b: b, opts: opts}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /status", h.authed(h.status))
 	mux.HandleFunc("GET /messages", h.authed(h.listMessages))
 	mux.HandleFunc("POST /messages", h.authed(h.sendText))
 	mux.HandleFunc("POST /images", h.authed(h.sendImage))
@@ -160,6 +162,10 @@ func (h *handler) sign(key, exp string) string {
 	mac := hmac.New(sha256.New, h.opts.SigningKey)
 	mac.Write([]byte(key + "\n" + exp))
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func (h *handler) status(w http.ResponseWriter, _ *http.Request, _ User) {
+	writeJSON(w, http.StatusOK, map[string]bool{"available": h.b.Available()})
 }
 
 func (h *handler) listMessages(w http.ResponseWriter, r *http.Request, u User) {
@@ -338,6 +344,8 @@ func (h *handler) fail(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "only PNG, JPEG, GIF and WebP images are supported")
 	case errors.Is(err, ErrTooLarge), errors.As(err, &maxErr):
 		writeError(w, http.StatusRequestEntityTooLarge, "image is too large")
+	case errors.Is(err, ErrUnavailable):
+		writeError(w, http.StatusServiceUnavailable, "support chat is not available")
 	case errors.Is(err, ErrRateLimited):
 		writeError(w, http.StatusTooManyRequests, "too many messages, try again in a minute")
 	case errors.Is(err, http.ErrMissingFile):

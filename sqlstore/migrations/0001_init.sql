@@ -6,8 +6,10 @@ CREATE TABLE IF NOT EXISTS livechat_conversations (
     id              TEXT PRIMARY KEY,
     user_id         TEXT NOT NULL UNIQUE,
     user_name       TEXT NOT NULL DEFAULT '',
-    -- The topic: root (card) message id and thread id in the 飞书 group.
-    -- Empty until the user's first message opens the topic.
+    -- The topic: the 飞书 group (chat id) it lives in, its root (card)
+    -- message id and thread id. Empty until the user's first message opens
+    -- the topic.
+    topic_group     TEXT NOT NULL DEFAULT '',
     root_message_id TEXT NOT NULL DEFAULT '',
     thread_id       TEXT NOT NULL DEFAULT '',
     last_message_at BIGINT NOT NULL DEFAULT 0,
@@ -36,3 +38,11 @@ CREATE TABLE IF NOT EXISTS livechat_messages (
 );
 
 CREATE INDEX IF NOT EXISTS livechat_messages_conversation_idx ON livechat_messages (conversation_id, id);
+
+-- Small key/value settings, e.g. the connected 飞书 app (sealed by the host
+-- when it passes a Sealer: the value then holds the app secret encrypted).
+CREATE TABLE IF NOT EXISTS livechat_settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at BIGINT NOT NULL
+);

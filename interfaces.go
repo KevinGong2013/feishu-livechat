@@ -59,6 +59,9 @@ type URLSigner interface {
 
 // Backend is the topic group. Package feishu implements it.
 type Backend interface {
+	// Group is the group new topics are created in. A conversation whose
+	// topic is in another group gets a new topic.
+	Group() string
 	// CreateTopic posts the user's root card into the group and returns the
 	// new topic. dedupeKey makes retries of the same attempt idempotent.
 	CreateTopic(ctx context.Context, user User, dedupeKey string) (Topic, error)
@@ -73,6 +76,14 @@ type Backend interface {
 	FetchImage(ctx context.Context, remoteID, imageKey string) ([]byte, error)
 	// Ack marks an agent's message as forwarded (ok) or not (!ok).
 	Ack(ctx context.Context, remoteID string, ok bool) error
+}
+
+// Availability is an optional Backend capability: a backend that can be
+// unconfigured (no app connected yet) reports it, and the bridge then
+// refuses user messages with ErrUnavailable instead of accepting messages
+// it cannot deliver.
+type Availability interface {
+	Available() bool
 }
 
 // AgentMessage is an agent's reply that @-ed the bot, already reduced to

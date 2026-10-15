@@ -124,6 +124,7 @@ token = jwt.encode({"sub": user.id, "name": user.name,
 
 | 接口 | 说明 |
 |---|---|
+| `GET /status` | `{"available": bool}`：没接入飞书应用时为 false，前端据此隐藏聊天入口 |
 | `GET /messages?before=&after=&limit=` | 消息历史，升序返回；`{"messages": [...], "has_more": bool}`。不带参数时返回最新一页 |
 | `POST /messages` `{"text"}` | 发文字，最多 4000 字 |
 | `POST /images` | 发图片：请求体直接是图片，或 multipart 的 `file` 字段。支持 PNG / JPEG / GIF / WebP，最大 10 MB |
@@ -149,21 +150,27 @@ token = jwt.encode({"sub": user.id, "name": user.name,
 
 ## 作为 Go 库嵌入
 
+嵌进已有的 Go 服务时，飞书应用不写在环境变量里，而是在**运营管理页面扫码接入**：配置存进数据库（App Secret 由宿主加密），接入或更换应用都即时生效，不用重启。
+
 ```go
 store := sqlstore.New(db, sqlstore.Postgres) // 建表 SQL 在 sqlstore/migrations/，也可以直接调用 store.Migrate(ctx)
-fc, _ := feishu.New(feishu.Config{AppID: id, AppSecret: secret, ChatID: chatID})
+
+// 飞书配置存在 livechat_settings 表里，用宿主自己的加密（实现 feishu.Sealer）封装
+rt, _ := feishu.NewRuntime(feishu.RuntimeConfig{Settings: feishu.KVSettings(store, mySealer)})
+go rt.Run(ctx, bridge) // 只在处理客服回复的进程里运行：读取已保存的应用并保持长连接
+
 bridge, _ := livechat.New(livechat.Config{
 	Store:   store,
-	Blobs:   myBlobStore, // 实现 livechat.BlobStore；如果也实现了 URLSigner，图片会直接用对象存储的签名链接
-	Backend: fc,
+	Blobs:   myBlobStore, // 实现 livechat.BlobStore；如果也实现了 URLSigner，图片直接用对象存储的签名链接
+	Backend: rt,          // 还没接入应用时，用户接口返回 503，GET /status 返回 available=false
 	OnAgentMessage: func(ctx context.Context, userID string, m *livechat.Message, online bool) {
 		if !online {
 			// 用户没开着页面：发 Web Push / 站内信 / 邮件
 		}
 	},
 })
-go fc.Listen(ctx, bridge) // 只在处理客服回复的进程里运行
 
+// 用户侧接口
 mux.Handle("/api/v1/support/", bridge.Handler(livechat.HandlerOptions{
 	BasePath:   "/api/v1/support",
 	SigningKey: imageURLKey,
@@ -172,7 +179,22 @@ mux.Handle("/api/v1/support/", bridge.Handler(livechat.HandlerOptions{
 		return livechat.User{ID: u.ID, Name: u.Name, Fields: …, Links: …}, nil
 	},
 }))
+
+// 运营管理页接口：务必挂在你自己的管理员鉴权后面
+mux.Handle("/api/v1/admin/support/", requireAdmin(rt.AdminHandler("/api/v1/admin/support")))
 ```
+
+运营管理页用到的接口（`rt.AdminHandler`）：
+
+| 接口 | 说明 |
+|---|---|
+| `GET /status` | 当前接入的应用、群、机器人名，长连接状态（`connected` / `connecting` / `error`…），以及进行中的扫码流程（`setup.state`：`waiting` → `creating` → `done`，或 `failed` / `declined` / `expired`） |
+| `POST /setup` `{"app_name","group_name"}` | 发起扫码接入，返回链接和过期时间。已经有一个在等扫码的流程时直接返回它，刷新页面不会让正在扫的码失效 |
+| `GET /setup/qr.png` | 链接对应的二维码图片，页面直接 `<img>` 显示 |
+| `DELETE /setup` | 取消进行中的扫码 |
+| `POST /join-link` `{"validity"}` | 生成新的客服入群链接（`week` / `year` / `permanently`） |
+
+扫码确认后，Runtime 会创建话题群（机器人是群主，扫码的管理员自动进群），保存配置，并切换到新应用。重新扫码就是更换应用：用户下一条消息会在新群里开新话题。
 
 ## 限制和注意事项
 

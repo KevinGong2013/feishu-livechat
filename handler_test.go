@@ -60,6 +60,9 @@ func TestHandlerFlow(t *testing.T) {
 	if resp, _ := call(t, srv, "GET", "/api/support/messages", "", "", nil); resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("anonymous: %d", resp.StatusCode)
 	}
+	if _, body := call(t, srv, "GET", "/api/support/status", "bob", "", nil); strings.TrimSpace(string(body)) != `{"available":true}` {
+		t.Fatalf("status: %s", body)
+	}
 	// No conversation yet: empty history, not an error, and no topic opened.
 	resp, body := call(t, srv, "GET", "/api/support/messages", "bob", "", nil)
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), `"messages":[]`) {

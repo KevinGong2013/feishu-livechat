@@ -22,6 +22,8 @@ import (
 // fakeBackend is an in-memory topic group.
 type fakeBackend struct {
 	mu         sync.Mutex
+	group      string
+	down       bool // no app connected
 	n          int
 	created    []livechat.User
 	posts      map[string][]string // root → posted texts / "[image]"
@@ -32,7 +34,19 @@ type fakeBackend struct {
 }
 
 func newFakeBackend() *fakeBackend {
-	return &fakeBackend{posts: map[string][]string{}, gone: map[string]bool{}, images: map[string][]byte{}, acks: map[string]bool{}}
+	return &fakeBackend{group: "oc_group", posts: map[string][]string{}, gone: map[string]bool{}, images: map[string][]byte{}, acks: map[string]bool{}}
+}
+
+func (f *fakeBackend) Group() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.group
+}
+
+func (f *fakeBackend) Available() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return !f.down
 }
 
 func (f *fakeBackend) CreateTopic(_ context.Context, u livechat.User, _ string) (livechat.Topic, error) {
@@ -40,7 +54,7 @@ func (f *fakeBackend) CreateTopic(_ context.Context, u livechat.User, _ string) 
 	defer f.mu.Unlock()
 	f.n++
 	f.created = append(f.created, u)
-	t := livechat.Topic{RootMessageID: fmt.Sprintf("om_root_%d", f.n)}
+	t := livechat.Topic{Group: f.group, RootMessageID: fmt.Sprintf("om_root_%d", f.n)}
 	if !f.noThreadID {
 		t.ThreadID = fmt.Sprintf("omt_%d", f.n)
 	}
@@ -412,5 +426,42 @@ func TestRateLimit(t *testing.T) {
 	}
 	if _, err := e.bridge.SendText(ctx, livechat.User{ID: "bob"}, "hi"); err != nil {
 		t.Fatalf("other users are not limited: %v", err)
+	}
+}
+
+func TestReconnectedGroupGetsNewTopics(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	if _, err := e.bridge.SendText(ctx, alice, "first"); err != nil {
+		t.Fatal(err)
+	}
+	// The operator connects another app and group.
+	e.backend.mu.Lock()
+	e.backend.group = "oc_new_group"
+	e.backend.mu.Unlock()
+
+	if _, err := e.bridge.SendText(ctx, alice, "after reconnect"); err != nil {
+		t.Fatal(err)
+	}
+	c := e.conv(t, "alice")
+	if c.TopicGroup != "oc_new_group" || c.RootMessageID == "om_root_1" || e.backend.topics() != 2 {
+		t.Fatalf("no new topic in the new group: %+v", c)
+	}
+	if posts := e.backend.postsIn(c.RootMessageID); len(posts) != 1 || posts[0] != "after reconnect" {
+		t.Fatalf("posts in new topic: %v", posts)
+	}
+}
+
+func TestUnavailableBackendRefusesMessages(t *testing.T) {
+	e := newEnv(t)
+	e.backend.down = true
+	if e.bridge.Available() {
+		t.Fatal("bridge must report the backend unavailable")
+	}
+	if _, err := e.bridge.SendText(context.Background(), alice, "hello?"); !errors.Is(err, livechat.ErrUnavailable) {
+		t.Fatalf("send while unavailable: %v", err)
+	}
+	if msgs, _, _ := e.bridge.History(context.Background(), "alice", livechat.Query{}); len(msgs) != 0 {
+		t.Fatal("a refused message must not be stored")
 	}
 }

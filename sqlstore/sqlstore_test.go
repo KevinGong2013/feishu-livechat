@@ -38,7 +38,7 @@ func stores(t *testing.T) map[string]*sqlstore.Store {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { pg.Close() })
-		for _, tbl := range []string{"livechat_messages", "livechat_conversations", "livechat_schema_migrations"} {
+		for _, tbl := range []string{"livechat_messages", "livechat_conversations", "livechat_settings", "livechat_schema_migrations"} {
 			if _, err := pg.Exec("DROP TABLE IF EXISTS " + tbl); err != nil {
 				t.Fatal(err)
 			}
@@ -95,15 +95,18 @@ func testConversations(t *testing.T, s *sqlstore.Store) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 
-	ok, err := s.SetTopic(ctx, c1.ID, "", livechat.Topic{RootMessageID: "om_root"})
+	ok, err := s.SetTopic(ctx, c1.ID, "", livechat.Topic{Group: "oc_g", RootMessageID: "om_root"})
 	if err != nil || !ok {
 		t.Fatalf("SetTopic: %v %v", ok, err)
 	}
 	if ok, _ := s.SetTopic(ctx, c1.ID, "", livechat.Topic{RootMessageID: "om_other"}); ok {
 		t.Fatal("SetTopic must fail when the root changed underneath")
 	}
-	if ok, _ := s.SetTopic(ctx, c1.ID, "om_root", livechat.Topic{RootMessageID: "om_root", ThreadID: "omt_1"}); !ok {
+	if ok, _ := s.SetTopic(ctx, c1.ID, "om_root", livechat.Topic{Group: "oc_g", RootMessageID: "om_root", ThreadID: "omt_1"}); !ok {
 		t.Fatal("SetTopic with the current root must succeed")
+	}
+	if c, _ := s.ConversationByID(ctx, c1.ID); c.Topic() != (livechat.Topic{Group: "oc_g", RootMessageID: "om_root", ThreadID: "omt_1"}) {
+		t.Fatalf("topic not stored: %+v", c.Topic())
 	}
 	for _, q := range [][2]string{{"omt_1", ""}, {"", "om_root"}, {"omt_unknown", "om_root"}} {
 		c, err := s.ConversationByTopic(ctx, q[0], q[1])
@@ -233,4 +236,23 @@ func idsOf(ms []*livechat.Message) []string {
 		out = append(out, m.ID)
 	}
 	return out
+}
+
+func TestSettings(t *testing.T) {
+	ctx := context.Background()
+	for name, s := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			if _, err := s.GetSetting(ctx, "feishu"); !errors.Is(err, livechat.ErrNotFound) {
+				t.Fatalf("missing setting: %v", err)
+			}
+			for _, v := range []string{"v1", "v2"} {
+				if err := s.PutSetting(ctx, "feishu", v); err != nil {
+					t.Fatal(err)
+				}
+				if got, err := s.GetSetting(ctx, "feishu"); err != nil || got != v {
+					t.Fatalf("GetSetting = %q, %v; want %q", got, err, v)
+				}
+			}
+		})
+	}
 }

@@ -157,13 +157,13 @@ func (s *Store) q(query string) string {
 	return b.String()
 }
 
-const convColumns = `id, user_id, user_name, root_message_id, thread_id, last_message_at, last_sender, user_read_id, created_at`
+const convColumns = `id, user_id, user_name, topic_group, root_message_id, thread_id, last_message_at, last_sender, user_read_id, created_at`
 
 func scanConversation(row interface{ Scan(...any) error }) (*livechat.Conversation, error) {
 	var c livechat.Conversation
 	var lastAt, createdAt int64
 	var lastSender string
-	err := row.Scan(&c.ID, &c.UserID, &c.UserName, &c.RootMessageID, &c.ThreadID, &lastAt, &lastSender, &c.UserReadID, &createdAt)
+	err := row.Scan(&c.ID, &c.UserID, &c.UserName, &c.TopicGroup, &c.RootMessageID, &c.ThreadID, &lastAt, &lastSender, &c.UserReadID, &createdAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, livechat.ErrNotFound
 	}
@@ -210,8 +210,8 @@ func (s *Store) ConversationByTopic(ctx context.Context, threadID, rootMessageID
 }
 
 func (s *Store) SetTopic(ctx context.Context, conversationID, oldRoot string, t livechat.Topic) (bool, error) {
-	res, err := s.db.ExecContext(ctx, s.q(`UPDATE livechat_conversations SET root_message_id = ?, thread_id = ?
-		WHERE id = ? AND root_message_id = ?`), t.RootMessageID, t.ThreadID, conversationID, oldRoot)
+	res, err := s.db.ExecContext(ctx, s.q(`UPDATE livechat_conversations SET topic_group = ?, root_message_id = ?, thread_id = ?
+		WHERE id = ? AND root_message_id = ?`), t.Group, t.RootMessageID, t.ThreadID, conversationID, oldRoot)
 	if err != nil {
 		return false, err
 	}
@@ -357,6 +357,25 @@ func (s *Store) CountUnread(ctx context.Context, conversationID string) (int, er
 		WHERE m.conversation_id = ? AND m.sender = 'agent' AND m.recalled = 0 AND m.id > c.user_read_id`),
 		conversationID).Scan(&n)
 	return n, err
+}
+
+// GetSetting returns a value stored with PutSetting, or
+// livechat.ErrNotFound.
+func (s *Store) GetSetting(ctx context.Context, key string) (string, error) {
+	var v string
+	err := s.db.QueryRowContext(ctx, s.q(`SELECT value FROM livechat_settings WHERE key = ?`), key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", livechat.ErrNotFound
+	}
+	return v, err
+}
+
+// PutSetting stores value under key, replacing any previous value.
+func (s *Store) PutSetting(ctx context.Context, key, value string) error {
+	_, err := s.db.ExecContext(ctx, s.q(`INSERT INTO livechat_settings (key, value, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`),
+		key, value, time.Now().UnixMilli())
+	return err
 }
 
 func boolInt(b bool) int {

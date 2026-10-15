@@ -57,6 +57,9 @@ type Client struct {
 	log       *slog.Logger
 	botOpenID string
 	serial    serial
+	// onState, when set, hears the long connection's state changes
+	// ("connecting", "connected", "disconnected") and errors.
+	onState func(state string, err error)
 }
 
 var _ livechat.Backend = (*Client)(nil)
@@ -134,6 +137,9 @@ func (c *Client) Init(ctx context.Context) error {
 	return nil
 }
 
+// Group is the 话题群 topics are created in.
+func (c *Client) Group() string { return c.cfg.ChatID }
+
 func apiErr(op string, ce larkcore.CodeError) error {
 	return fmt.Errorf("feishu: %s: %s (code %d)", op, ce.Msg, ce.Code)
 }
@@ -161,7 +167,7 @@ func (c *Client) CreateTopic(ctx context.Context, u livechat.User, dedupeKey str
 	if !resp.Success() {
 		return livechat.Topic{}, apiErr("post root card", resp.CodeError)
 	}
-	return livechat.Topic{RootMessageID: deref(resp.Data.MessageId), ThreadID: deref(resp.Data.ThreadId)}, nil
+	return livechat.Topic{Group: c.cfg.ChatID, RootMessageID: deref(resp.Data.MessageId), ThreadID: deref(resp.Data.ThreadId)}, nil
 }
 
 func (c *Client) PostText(ctx context.Context, t livechat.Topic, text, dedupeKey string) (string, error) {
