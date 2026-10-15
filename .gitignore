@@ -1,0 +1,5 @@
+/data/
+/feishu-livechat
+*.db
+*.db-shm
+*.db-wal
