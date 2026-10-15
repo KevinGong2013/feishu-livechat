@@ -1,0 +1,46 @@
+name: release
+
+# 手动发布一个版本：在 Actions 页面（或 API）运行，填版本号。会先跑一遍检查和
+# 测试，通过后在所选分支的当前提交上创建标签和 GitHub Release（自动生成更新
+# 说明）。Go 模块按标签取版本，发布后即可 `go get ...@vX.Y.Z`。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号，例如 v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "版本号应形如 v1.2.3（或 v1.2.3-rc.1），收到：$VERSION" >&2
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+            echo "标签 $VERSION 已存在" >&2
+            exit 1
+          fi
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: Create tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: gh release create "$VERSION" --target "$(git rev-parse HEAD)" --title "$VERSION" --generate-notes
