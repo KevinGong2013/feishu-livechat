@@ -2,11 +2,13 @@
 // service, for sites that are not written in Go (Go services can embed the
 // livechat package instead).
 //
-//	feishu-livechat setup -name 在线客服    create the 话题群, print its chat id and a join link
+//	feishu-livechat init                     scan a QR code in 飞书: creates the app and the 话题群, writes feishu-livechat.env
 //	feishu-livechat serve                    run the HTTP API and the 飞书 listener
+//	feishu-livechat setup -name 在线客服    for an existing app: create the 话题群, print its chat id and a join link
 //	feishu-livechat token -user u1 -name 张三  mint a user token for testing
 //
-// Configuration is read from the environment; see README.md.
+// Configuration is read from the environment, falling back to
+// feishu-livechat.env (or the file LIVECHAT_ENV_FILE names); see README.md.
 package main
 
 import (
@@ -40,6 +42,7 @@ import (
 var demoFS embed.FS
 
 const usage = `usage:
+  feishu-livechat init [-name <应用名>] [-group <群名称>] [-env feishu-livechat.env]
   feishu-livechat setup -name <群名称> [-link week|year|permanently]
   feishu-livechat setup -chat <chat id> [-link ...]     print a new join link for an existing group
   feishu-livechat serve
@@ -54,8 +57,17 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if os.Args[1] != "init" {
+		if err := loadEnvFile(env("LIVECHAT_ENV_FILE", defaultEnvFile)); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+	}
+
 	var err error
 	switch os.Args[1] {
+	case "init":
+		err = initCmd(ctx, os.Args[2:])
 	case "serve":
 		err = serve(ctx)
 	case "setup":

@@ -24,36 +24,49 @@
 
 适合不是 Go 写的网站。Go 服务可以把它当库嵌进去，见[作为 Go 库嵌入](#作为-go-库嵌入)。
 
-### 1. 在飞书开放平台创建企业自建应用
-
-1. 在[飞书开放平台](https://open.feishu.cn/app)创建**企业自建应用**，开启**机器人**能力。
-2. 在「权限管理」开通：
-   - 获取与发送单聊、群组消息 `im:message`
-   - 以应用的身份发消息 `im:message:send_as_bot`
-   - 接收群聊中 @机器人消息事件 `im:message.group_at_msg:readonly`
-   - 获取与上传图片或文件资源 `im:resource`
-   - 获取与更新群组信息 `im:chat`（只在 `setup` 建群时用到）
-
-   不需要「获取群组中所有消息」这类敏感权限：机器人只接收 @它 的消息。如果接口报缺少权限，错误信息里会写明是哪一项，以飞书的提示为准。
-3. 在「事件与回调」里选择**使用长连接接收事件**，添加事件「接收消息」`im.message.receive_v1` 和「消息被撤回」`im.message.recalled_v1`。用长连接就不需要公网回调地址。
-4. 创建版本并发布，权限和事件才会生效。
-
-### 2. 建客服话题群
+### 1. 扫码初始化
 
 ```bash
-export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx
-feishu-livechat setup -name 在线客服
-# bot:        客服机器人 (ou_xxx)
-# group:      在线客服 (话题模式, owner: the bot)
-# chat id:    oc_xxx   → set FEISHU_CHAT_ID to this
-# join link:  https://applink.feishu.cn/...   (valid: week; send it to your agents)
+feishu-livechat init
 ```
 
-群由机器人创建，机器人是群主，所以它能在卡片里 @所有人。把入群链接发给客服。链接过期后可以用 `setup -chat oc_xxx` 重新生成。
+终端会显示一个二维码。用飞书扫码（或者把下面的链接发到飞书里点开），会打开一个已经填好的「创建应用」页面：应用名、需要的权限、需要订阅的事件都预先填好了，确认即可。这和 lark-cli 用的是同一套飞书官方「扫码一键创建应用」机制。确认后 `init` 会自动完成：
+
+- 创建话题群：机器人是群主（所以能在卡片里 @所有人），扫码的人自动进群；
+- 生成其他客服用的入群链接；
+- 把 App ID、App Secret、群 chat_id 和新生成的 token 签名密钥写进 `feishu-livechat.env`（权限 0600）。之后 `serve`、`setup`、`token` 都会自动读取这个文件，环境变量优先于文件。
+
+需要申请的权限都不是敏感权限：机器人只接收 @它 的消息，不需要「获取群组中所有消息」。
+
+<details>
+<summary>手动创建应用（扫码不可用时）</summary>
+
+1. 在[飞书开放平台](https://open.feishu.cn/app)创建**企业自建应用**，开启**机器人**能力。
+2. 开通权限：`im:message`、`im:message:send_as_bot`、`im:message.group_at_msg:readonly`、`im:resource`、`im:chat`。
+3. 「事件与回调」选择**使用长连接接收事件**，添加 `im.message.receive_v1` 和 `im.message.recalled_v1`。
+4. 创建版本并发布。
+5. `FEISHU_APP_ID=… FEISHU_APP_SECRET=… feishu-livechat setup -name 在线客服`：创建话题群（机器人是群主），打印 chat_id 和入群链接。入群链接过期后用 `setup -chat oc_xxx` 重新生成。
 
 也可以用已有的话题群：把机器人拉进去，并确认群设置允许机器人 @所有人。
 
+</details>
+
+**扫码创建后要确认的两件事**（这台开发机连不到飞书，所以还没实测）：
+
+- 事件订阅方式是不是**长连接**：如果客服 @机器人 后用户没收到，到开放平台应用页「事件与回调」里检查。
+- 应用的**可用范围**是否包含所有客服：如果只有扫码人自己，其他客服 @机器人 可能没有反应，需要把客服加进可用范围并发布版本。
+
+### 2. 准备网站这一侧
+
+`init` 已经生成了 `LIVECHAT_JWT_SECRET`。网站后端用它给登录用户签 token（见第 4 步）；如果聊天窗和服务不在同一个域名下，还要设置 `LIVECHAT_ALLOWED_ORIGINS`。
+
 ### 3. 启动
+
+```bash
+feishu-livechat serve        # 读取 feishu-livechat.env
+```
+
+或者用 Docker，把配置作为环境变量传入：
 
 ```bash
 docker run -d -p 8080:8080 -v livechat:/data \

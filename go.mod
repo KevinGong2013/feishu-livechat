@@ -9,6 +9,7 @@ require (
 	github.com/larksuite/oapi-sdk-go/v3 v3.12.2
 	golang.org/x/image v0.41.0
 	modernc.org/sqlite v1.40.1
+	rsc.io/qr v0.2.0
 )
 
 require (

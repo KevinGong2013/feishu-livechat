@@ -35,6 +35,9 @@ type Config struct {
 	ChatID string
 	// Lark selects open.larksuite.com instead of open.feishu.cn.
 	Lark bool
+	// OpenBaseURL overrides the Open API host entirely (tests, private
+	// deployments).
+	OpenBaseURL string
 	// CardHint is the root card's footnote; DefaultCardHint if empty.
 	CardHint string
 	// DeliveredEmoji and FailedEmoji are the 飞书 emoji_type reactions put
@@ -80,7 +83,10 @@ func New(cfg Config) (*Client, error) {
 		cfg.Logger = slog.Default()
 	}
 	opts := []lark.ClientOptionFunc{lark.WithLogLevel(larkcore.LogLevelWarn)}
-	if cfg.Lark {
+	switch {
+	case cfg.OpenBaseURL != "":
+		opts = append(opts, lark.WithOpenBaseUrl(cfg.OpenBaseURL))
+	case cfg.Lark:
 		opts = append(opts, lark.WithOpenBaseUrl(lark.LarkBaseUrl))
 	}
 	return &Client{

@@ -7,17 +7,22 @@ import (
 )
 
 // CreateTopicGroup creates a private group in 话题 mode with the bot as its
-// owner — which is what lets the bot @所有人 on every root card — and
-// returns its chat id. Agents join through ShareLink.
-func (c *Client) CreateTopicGroup(ctx context.Context, name, description string) (string, error) {
+// owner — which is what lets the bot @所有人 on every root card — adds the
+// given members (open_ids) and returns its chat id. Other agents join
+// through ShareLink.
+func (c *Client) CreateTopicGroup(ctx context.Context, name, description string, memberOpenIDs ...string) (string, error) {
+	body := larkim.NewCreateChatReqBodyBuilder().
+		Name(name).
+		Description(description).
+		ChatMode("group").
+		ChatType("private").
+		GroupMessageType(larkim.CreateChatGroupMessageTypeThread)
+	if len(memberOpenIDs) > 0 {
+		body.UserIdList(memberOpenIDs)
+	}
 	resp, err := c.api.Im.Chat.Create(ctx, larkim.NewCreateChatReqBuilder().
-		Body(larkim.NewCreateChatReqBodyBuilder().
-			Name(name).
-			Description(description).
-			ChatMode("group").
-			ChatType("private").
-			GroupMessageType(larkim.CreateChatGroupMessageTypeThread).
-			Build()).
+		UserIdType("open_id").
+		Body(body.Build()).
 		Build())
 	if err != nil {
 		return "", err
