@@ -193,6 +193,7 @@ func serve(ctx context.Context) error {
 		BasePath:     "/api",
 		SigningKey:   signing[:],
 		Authenticate: jwtAuthenticator(secret),
+		AgentName:    store.AgentNames("客服 %02d"),
 	})
 	mux := http.NewServeMux()
 	mux.Handle("/api/", cors(api, env("LIVECHAT_ALLOWED_ORIGINS", "")))

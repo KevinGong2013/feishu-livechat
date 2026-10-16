@@ -29,6 +29,7 @@ func newServer(t *testing.T) (*env, *httptest.Server) {
 			}
 			return livechat.User{ID: id, Name: id}, nil
 		},
+		AgentName: func(_ context.Context, agentID string) string { return "客服 " + agentID },
 	})
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
@@ -188,12 +189,12 @@ func TestHandlerEvents(t *testing.T) {
 
 	root := e.conv(t, "carol").RootMessageID
 	go func() {
-		_ = e.bridge.HandleAgentMessage(context.Background(), livechat.AgentMessage{RemoteID: "om_live", RootMessageID: root, Parts: []livechat.Part{{Text: "实时回复"}}})
+		_ = e.bridge.HandleAgentMessage(context.Background(), livechat.AgentMessage{RemoteID: "om_live", AgentID: "ou_7", RootMessageID: root, Parts: []livechat.Part{{Text: "实时回复"}}})
 	}()
 	name, data := readEvent()
 	var v livechat.MessageView
 	_ = json.Unmarshal([]byte(data), &v)
-	if name != "message" || v.Sender != livechat.SenderAgent || v.Blocks[0].Text != "实时回复" {
+	if name != "message" || v.Sender != livechat.SenderAgent || v.Blocks[0].Text != "实时回复" || v.Agent != "客服 ou_7" {
 		t.Fatalf("event %q %s", name, data)
 	}
 }

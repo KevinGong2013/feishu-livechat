@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -357,6 +358,46 @@ func (s *Store) CountUnread(ctx context.Context, conversationID string) (int, er
 		WHERE m.conversation_id = ? AND m.sender = 'agent' AND m.recalled = 0 AND m.id > c.user_read_id`),
 		conversationID).Scan(&n)
 	return n, err
+}
+
+// AgentNumber is the agent's place, from 1, in the order agents first
+// replied to anyone, or livechat.ErrNotFound if they never have. Replies
+// are never deleted, so an agent keeps their number.
+func (s *Store) AgentNumber(ctx context.Context, agentID string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, s.q(`SELECT COUNT(*) FROM (
+		SELECT MIN(id) AS first FROM livechat_messages WHERE sender = 'agent' AND agent_id <> '' GROUP BY agent_id
+	) f WHERE f.first <= (SELECT MIN(id) FROM livechat_messages WHERE sender = 'agent' AND agent_id = ?)`),
+		agentID).Scan(&n)
+	if err == nil && n == 0 {
+		err = livechat.ErrNotFound
+	}
+	return n, err
+}
+
+// AgentNames returns a livechat.HandlerOptions.AgentName that shows each
+// agent by number, formatted with format (e.g. "客服 %02d"), so users can
+// tell agents apart without learning who they are. Numbers are cached.
+func (s *Store) AgentNames(format string) func(ctx context.Context, agentID string) string {
+	var mu sync.Mutex
+	cache := map[string]string{}
+	return func(ctx context.Context, agentID string) string {
+		mu.Lock()
+		name, ok := cache[agentID]
+		mu.Unlock()
+		if ok {
+			return name
+		}
+		n, err := s.AgentNumber(ctx, agentID)
+		if err != nil {
+			return ""
+		}
+		name = fmt.Sprintf(format, n)
+		mu.Lock()
+		cache[agentID] = name
+		mu.Unlock()
+		return name
+	}
 }
 
 // GetSetting returns a value stored with PutSetting, or

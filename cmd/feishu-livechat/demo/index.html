@@ -100,7 +100,7 @@ function render(stickToBottom) {
     const meta = document.createElement("div");
     meta.className = "meta" + (m.status === "failed" ? " failed" : "");
     const time = new Date(m.created_at).toLocaleTimeString();
-    meta.textContent = m.sender === "agent" ? "客服 · " + time : time + (m.status === "sending" ? " · 发送中" : m.status === "failed" ? " · 发送失败" : "");
+    meta.textContent = m.sender === "agent" ? (m.agent || "客服") + " · " + time : time + (m.status === "sending" ? " · 发送中" : m.status === "failed" ? " · 发送失败" : "");
     el.append(bubble, meta);
     list.append(el);
   });

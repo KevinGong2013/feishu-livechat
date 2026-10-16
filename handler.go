@@ -40,6 +40,13 @@ type HandlerOptions struct {
 
 	// ImageURLTTL is how long image URLs stay valid. Default 1h.
 	ImageURLTTL time.Duration
+
+	// AgentName is the name users see on an agent's replies, e.g. "客服 03"
+	// (it gets the agent's 飞书 open_id, which is not meant for users). It
+	// runs for every agent message in a response, so keep it cheap or
+	// cached; sqlstore.Store.AgentNames numbers agents in the order they
+	// first replied. Nil, or an empty result, leaves the name out.
+	AgentName func(ctx context.Context, agentID string) string
 }
 
 // Handler serves the chat API:
@@ -108,6 +115,7 @@ type MessageView struct {
 	Sender    Sender      `json:"sender"`
 	Status    Status      `json:"status"`
 	Recalled  bool        `json:"recalled,omitempty"`
+	Agent     string      `json:"agent,omitempty"` // agent replies: who wrote it, see HandlerOptions.AgentName
 	Blocks    []BlockView `json:"blocks"`
 	CreatedAt int64       `json:"created_at"` // unix milliseconds
 }
@@ -129,6 +137,9 @@ func (h *handler) view(ctx context.Context, m *Message) MessageView {
 		Recalled:  m.Recalled,
 		Blocks:    []BlockView{},
 		CreatedAt: m.CreatedAt.UnixMilli(),
+	}
+	if m.Sender == SenderAgent && m.AgentID != "" && h.opts.AgentName != nil {
+		v.Agent = h.opts.AgentName(ctx, m.AgentID)
 	}
 	if m.Recalled {
 		return v // a recalled reply's content is not handed out anymore

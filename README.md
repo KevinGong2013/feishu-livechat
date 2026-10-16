@@ -138,13 +138,14 @@ token = jwt.encode({"sub": user.id, "name": user.name,
 消息格式：
 
 ```json
-{"id": "0192…", "sender": "user|agent", "status": "sending|sent|failed", "recalled": false,
+{"id": "0192…", "sender": "user|agent", "status": "sending|sent|failed", "recalled": false, "agent": "客服 03",
  "blocks": [{"type": "text", "text": "…"}, {"type": "image", "url": "/api/files/…", "width": 800, "height": 600}],
  "created_at": 1760000000000}
 ```
 
 - 前端按 `id` 合并消息：同一条消息会先以 `sending` 出现，再以 `sent` 或 `failed` 出现一次。
 - `id` 是 UUIDv7，可以直接按字符串排序。
+- `agent` 只出现在客服回复上，是给用户看的客服名（`HandlerOptions.AgentName`，内置的 `store.AgentNames` 按客服第一次回复的先后编号）；没配置时不返回。
 - SSE 断线重连后，请求 `GET /messages?after=<最新 id>` 补齐断线期间的消息。
 - `EventSource` 不能带请求头，所以要用 `fetch` 读取 SSE。写法见 `cmd/feishu-livechat/demo/index.html`。
 
@@ -178,6 +179,9 @@ mux.Handle("/api/v1/support/", bridge.Handler(livechat.HandlerOptions{
 		u := currentUser(r) // 你自己的登录态
 		return livechat.User{ID: u.ID, Name: u.Name, Fields: …, Links: …}, nil
 	},
+	// 可选：客服回复上带的名字（消息的 agent 字段）。按客服第一次回复的先后编号，
+	// 用户能分清是哪位客服，又看不到真名
+	AgentName: store.AgentNames("客服 %02d"),
 }))
 
 // 运营管理页接口：务必挂在你自己的管理员鉴权后面

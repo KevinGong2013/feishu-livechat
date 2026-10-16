@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -252,6 +253,42 @@ func TestSettings(t *testing.T) {
 				if got, err := s.GetSetting(ctx, "feishu"); err != nil || got != v {
 					t.Fatalf("GetSetting = %q, %v; want %q", got, err, v)
 				}
+			}
+		})
+	}
+}
+
+func TestAgentNumber(t *testing.T) {
+	ctx := context.Background()
+	for name, s := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			c1, _ := s.EnsureConversation(ctx, "user-1", "1")
+			c2, _ := s.EnsureConversation(ctx, "user-2", "2")
+			// ou_b replies first (to user-1), then ou_a (to user-2), then ou_b again.
+			for i, r := range []struct{ conv, agent string }{{c1.ID, "ou_b"}, {c2.ID, "ou_a"}, {c2.ID, "ou_b"}} {
+				m := msg(r.conv, livechat.SenderAgent, fmt.Sprintf("om_%d", i))
+				m.AgentID = r.agent
+				if _, err := s.InsertMessage(ctx, m); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := s.InsertMessage(ctx, msg(r.conv, livechat.SenderUser, "")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for agent, want := range map[string]int{"ou_b": 1, "ou_a": 2} {
+				if n, err := s.AgentNumber(ctx, agent); err != nil || n != want {
+					t.Fatalf("AgentNumber(%s) = %d, %v; want %d", agent, n, err, want)
+				}
+			}
+			if _, err := s.AgentNumber(ctx, "ou_never"); !errors.Is(err, livechat.ErrNotFound) {
+				t.Fatalf("unknown agent: %v", err)
+			}
+			names := s.AgentNames("客服 %02d")
+			if got := names(ctx, "ou_a"); got != "客服 02" {
+				t.Fatalf("AgentNames = %q", got)
+			}
+			if got := names(ctx, "ou_never"); got != "" {
+				t.Fatalf("unknown agent name = %q", got)
 			}
 		})
 	}
