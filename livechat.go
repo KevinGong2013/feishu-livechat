@@ -6,7 +6,9 @@
 //     topic by the bot.
 //   - 飞书 → user: only replies that @ the bot are forwarded; everything else in
 //     the topic is the agents talking among themselves. Forwarded replies get a
-//     ✅ reaction, ones that could not be forwarded get ❌.
+//     ✅ (DONE) reaction, ones that could not be forwarded get ❌ (CrossMark).
+//     When the user has read a forwarded reply, the bot adds another reaction
+//     (Get by default) on each message that newly became read.
 //
 // The package itself only knows conversations and messages. Where they are
 // stored (Store), where images live (BlobStore) and how the topic group is

@@ -109,7 +109,7 @@ func (s *Store) apply(ctx context.Context, version int, body string) error {
 	}
 	defer tx.Rollback()
 	for _, stmt := range splitStatements(body) {
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+		if err := s.execMigration(ctx, tx, stmt); err != nil {
 			return err
 		}
 	}
@@ -117,6 +117,22 @@ func (s *Store) apply(ctx context.Context, version int, body string) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// execMigration runs one migration statement. SQLite has no
+// "ADD COLUMN IF NOT EXISTS" (Postgres does), so that clause is stripped
+// and a duplicate-column error is treated as success. That lets a host
+// which already added the column, such as apkgo-cloud migration 062, apply
+// the library migration without failing.
+func (s *Store) execMigration(ctx context.Context, tx *sql.Tx, stmt string) error {
+	if s.dialect == SQLite {
+		stmt = strings.ReplaceAll(stmt, "ADD COLUMN IF NOT EXISTS", "ADD COLUMN")
+	}
+	_, err := tx.ExecContext(ctx, stmt)
+	if err != nil && s.dialect == SQLite && strings.Contains(err.Error(), "duplicate column name") {
+		return nil
+	}
+	return err
 }
 
 // splitStatements splits a migration on semicolons after dropping comment
@@ -343,12 +359,130 @@ func (s *Store) ListMessages(ctx context.Context, conversationID string, q livec
 	return out, more, nil
 }
 
-func (s *Store) MarkRead(ctx context.Context, conversationID, messageID string) error {
-	_, err := s.db.ExecContext(ctx, s.q(`UPDATE livechat_conversations SET user_read_id = ?
-		WHERE id = ? AND user_read_id < ?
+func (s *Store) MarkRead(ctx context.Context, conversationID, messageID string) (bool, string, error) {
+	for attempt := 0; attempt < 8; attempt++ {
+		advanced, old, retry, err := s.markReadOnce(ctx, conversationID, messageID)
+		if err != nil || !retry {
+			return advanced, old, err
+		}
+	}
+	return false, "", errors.New("livechat: mark read lost the race")
+}
+
+func (s *Store) markReadOnce(ctx context.Context, conversationID, messageID string) (advanced bool, old string, retry bool, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, "", false, err
+	}
+	defer tx.Rollback()
+
+	err = tx.QueryRowContext(ctx, s.q(`SELECT user_read_id FROM livechat_conversations WHERE id = ?`), conversationID).Scan(&old)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, "", false, nil
+	}
+	if err != nil {
+		return false, "", false, err
+	}
+	if old >= messageID {
+		return false, old, false, nil
+	}
+	res, err := tx.ExecContext(ctx, s.q(`UPDATE livechat_conversations SET user_read_id = ?
+		WHERE id = ? AND user_read_id = ?
 		AND EXISTS (SELECT 1 FROM livechat_messages WHERE id = ? AND conversation_id = ?)`),
-		messageID, conversationID, messageID, messageID, conversationID)
-	return err
+		messageID, conversationID, old, messageID, conversationID)
+	if err != nil {
+		return false, "", false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, "", false, err
+	}
+	if n == 1 {
+		return true, old, false, tx.Commit()
+	}
+	var exists int
+	if err := tx.QueryRowContext(ctx, s.q(`SELECT COUNT(*) FROM livechat_messages WHERE id = ? AND conversation_id = ?`), messageID, conversationID).Scan(&exists); err != nil {
+		return false, "", false, err
+	}
+	if exists == 0 {
+		return false, "", false, nil
+	}
+	return false, "", true, nil
+}
+
+// readFloorKey remembers the read pointer from the first claim of a
+// conversation. Messages at or below it were already read before read
+// reactions existed and are never claimed, so history is not backfilled.
+// A later claim still picks up rows above the floor whose read_reacted was
+// put back to 0.
+func readFloorKey(conversationID string) string {
+	return "read_floor:" + conversationID
+}
+
+func (s *Store) ClaimReadReactions(ctx context.Context, conversationID, oldReadID, newReadID string) ([]string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	now := time.Now().UnixMilli()
+	if _, err := tx.ExecContext(ctx, s.q(`INSERT INTO livechat_settings (key, value, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+		WHERE excluded.value < livechat_settings.value`), readFloorKey(conversationID), oldReadID, now); err != nil {
+		return nil, err
+	}
+	var floor string
+	if err := tx.QueryRowContext(ctx, s.q(`SELECT value FROM livechat_settings WHERE key = ?`), readFloorKey(conversationID)).Scan(&floor); err != nil {
+		return nil, err
+	}
+	rows, err := tx.QueryContext(ctx, s.q(`UPDATE livechat_messages SET read_reacted = 1
+		WHERE conversation_id = ?
+		  AND sender = 'agent'
+		  AND recalled = 0
+		  AND remote_id IS NOT NULL
+		  AND read_reacted = 0
+		  AND id > ?
+		  AND id <= ?
+		RETURNING remote_id`), conversationID, floor, newReadID)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+func (s *Store) ReleaseReadReactions(ctx context.Context, remoteIDs []string) error {
+	var first error
+	for _, id := range remoteIDs {
+		if id == "" {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, s.q(`UPDATE livechat_messages SET read_reacted = 0 WHERE remote_id = ? AND read_reacted = 1`), id); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
 func (s *Store) CountUnread(ctx context.Context, conversationID string) (int, error) {

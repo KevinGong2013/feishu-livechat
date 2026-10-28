@@ -36,8 +36,22 @@ type Store interface {
 	// and for the default newest page, newer for After).
 	ListMessages(ctx context.Context, conversationID string, q Query) ([]*Message, bool, error)
 	// MarkRead moves the user's read pointer forward to messageID (never
-	// back).
-	MarkRead(ctx context.Context, conversationID, messageID string) error
+	// back). advanced is false when the pointer did not move, including when
+	// messageID is unknown or belongs to another conversation. oldReadID is
+	// the pointer before this call when it moved (empty if it was unset).
+	MarkRead(ctx context.Context, conversationID, messageID string) (advanced bool, oldReadID string, err error)
+	// ClaimReadReactions claims agent messages that should receive the
+	// "user has read" reaction and returns the remote ids this call won.
+	// A row is eligible when sender is agent, it is not recalled, remote_id
+	// is set, and read_reacted was 0. The claim is a conditional update, so
+	// concurrent callers win each row at most once. Messages the user had
+	// already read before the first claim for this conversation are left
+	// alone (no backfill). Rows released after a failed attempt are claimed
+	// again by a later read.
+	ClaimReadReactions(ctx context.Context, conversationID, oldReadID, newReadID string) ([]string, error)
+	// ReleaseReadReactions sets read_reacted back to 0 so a later read
+	// retries the reaction.
+	ReleaseReadReactions(ctx context.Context, remoteIDs []string) error
 	// CountUnread counts agent messages after the read pointer that were not
 	// recalled.
 	CountUnread(ctx context.Context, conversationID string) (int, error)
@@ -76,6 +90,18 @@ type Backend interface {
 	FetchImage(ctx context.Context, remoteID, imageKey string) ([]byte, error)
 	// Ack marks an agent's message as forwarded (ok) or not (!ok).
 	Ack(ctx context.Context, remoteID string, ok bool) error
+}
+
+// Reactor is an optional Backend capability. When the backend implements
+// it, MarkRead adds a reaction to each agent message the user has newly
+// read. Package feishu's Client and Runtime implement it.
+type Reactor interface {
+	// React adds one emoji reaction to the remote message. emoji is the
+	// backend's emoji type (a 飞书 emoji_type, such as Get).
+	React(ctx context.Context, remoteID, emoji string) error
+	// ReadEmoji is the emoji used for "the user has read this". Empty means
+	// the bridge does not add read reactions.
+	ReadEmoji() string
 }
 
 // Availability is an optional Backend capability: a backend that can be

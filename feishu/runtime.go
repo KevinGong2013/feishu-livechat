@@ -44,12 +44,13 @@ type Runtime struct {
 
 var _ livechat.Backend = (*Runtime)(nil)
 var _ livechat.Availability = (*Runtime)(nil)
+var _ livechat.Reactor = (*Runtime)(nil)
 
 // RuntimeConfig configures a Runtime.
 type RuntimeConfig struct {
 	Settings SettingsStore
 	// Base supplies everything except the app and the group, which come
-	// from Settings: CardHint, the ack emojis, MaxImageBytes, Logger.
+	// from Settings: CardHint, the ack and read emojis, MaxImageBytes, Logger.
 	Base Config
 	// AccountsURL and Base.OpenBaseURL redirect the 飞书 endpoints (tests).
 	AccountsURL string
@@ -247,6 +248,24 @@ func (r *Runtime) Ack(ctx context.Context, remoteID string, ok bool) error {
 		return err
 	}
 	return c.Ack(ctx, remoteID, ok)
+}
+
+func (r *Runtime) React(ctx context.Context, remoteID, emoji string) error {
+	c, err := r.current()
+	if err != nil {
+		return err
+	}
+	return c.React(ctx, remoteID, emoji)
+}
+
+// ReadEmoji is the connected app's read reaction, or "" when no app is
+// connected yet (the bridge then skips read reactions).
+func (r *Runtime) ReadEmoji() string {
+	c, err := r.current()
+	if err != nil {
+		return ""
+	}
+	return c.ReadEmoji()
 }
 
 // ShareLink returns a new join link for the connected group.
