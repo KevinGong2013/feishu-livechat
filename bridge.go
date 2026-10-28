@@ -29,6 +29,10 @@ var (
 	// conversation (a topic someone started by hand, or one replaced after
 	// its root card was deleted). The reply is ignored.
 	ErrUnknownTopic = errors.New("livechat: topic belongs to no conversation")
+	// ErrMessageGone: the remote message was recalled or deleted, so a
+	// reaction cannot be added and must not be retried. Feishu reports this
+	// as 231003 or 230110.
+	ErrMessageGone = errors.New("livechat: remote message is gone")
 )
 
 const (
@@ -170,6 +174,10 @@ func (b *Bridge) accept(ctx context.Context, userID string, m *Message) error {
 // deliverTimeout bounds posting one message into the group, card creation
 // and one retry included.
 const deliverTimeout = 30 * time.Second
+
+// readReactionTimeout bounds the background "user has read" reactions for
+// one MarkRead, remote calls included.
+const readReactionTimeout = 30 * time.Second
 
 func (b *Bridge) deliver(ctx context.Context, u User, conv *Conversation, m *Message, post func(context.Context, Topic) (string, error)) {
 	// A user closing the page mid-send must not abort a post that may
@@ -365,6 +373,10 @@ func (b *Bridge) History(ctx context.Context, userID string, q Query) ([]*Messag
 }
 
 // MarkRead records that the user has seen everything up to messageID.
+// When the read pointer moves forward and the backend implements Reactor,
+// every newly read agent message gets a read reaction in the background.
+// That work does not delay this call or change its error: a failed reaction
+// is retried on a later read, except when the remote message is gone.
 func (b *Bridge) MarkRead(ctx context.Context, userID, messageID string) error {
 	conv, err := b.cfg.Store.ConversationByUser(ctx, userID)
 	if errors.Is(err, ErrNotFound) {
@@ -373,7 +385,67 @@ func (b *Bridge) MarkRead(ctx context.Context, userID, messageID string) error {
 	if err != nil {
 		return err
 	}
-	return b.cfg.Store.MarkRead(ctx, conv.ID, messageID)
+	advanced, old, err := b.cfg.Store.MarkRead(ctx, conv.ID, messageID)
+	if err != nil || !advanced {
+		return err
+	}
+	b.reactNewlyRead(ctx, conv.ID, old, messageID)
+	return nil
+}
+
+// reactNewlyRead claims the agent messages that just became read and reacts
+// to each of them off the request path. The request context is detached: the
+// handler canceling it when POST /read returns must not drop the reaction.
+func (b *Bridge) reactNewlyRead(ctx context.Context, convID, oldID, newID string) {
+	r, ok := b.cfg.Backend.(Reactor)
+	if !ok {
+		return
+	}
+	emoji := r.ReadEmoji()
+	if emoji == "" {
+		return
+	}
+	go b.reactReadAsync(ctx, r, emoji, convID, oldID, newID)
+}
+
+func (b *Bridge) reactReadAsync(parent context.Context, r Reactor, emoji, convID, oldID, newID string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), readReactionTimeout)
+	defer cancel()
+	ids, err := b.cfg.Store.ClaimReadReactions(ctx, convID, oldID, newID)
+	if err != nil {
+		b.log.Warn("livechat: claim read reactions", "conversation", convID, "err", err)
+		return
+	}
+	var release []string
+	for i, id := range ids {
+		err := r.React(ctx, id, emoji)
+		switch {
+		case err == nil:
+			continue
+		case errors.Is(err, ErrMessageGone):
+			// Recalled or deleted in the group: keep read_reacted so a later
+			// read does not try again.
+			b.log.Warn("livechat: read reaction skipped, message is gone", "remote_id", id, "err", err)
+			continue
+		default:
+			b.log.Warn("livechat: read reaction", "remote_id", id, "err", err)
+			release = append(release, id)
+		}
+		if ctx.Err() != nil {
+			release = append(release, ids[i+1:]...)
+			break
+		}
+	}
+	if len(release) == 0 {
+		return
+	}
+	// The reaction timeout may already have fired; putting the rows back
+	// still has to succeed so the next read can retry.
+	relCtx, relCancel := context.WithTimeout(context.WithoutCancel(parent), 5*time.Second)
+	defer relCancel()
+	if err := b.cfg.Store.ReleaseReadReactions(relCtx, release); err != nil {
+		b.log.Warn("livechat: release read reactions", "err", err)
+	}
 }
 
 // Unread counts the agent replies the user has not seen.

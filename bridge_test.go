@@ -8,11 +8,15 @@ import (
 	"image"
 	"image/png"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
 
 	livechat "github.com/KevinGong2013/feishu-livechat"
@@ -120,6 +124,113 @@ func (f *fakeBackend) ack(remoteID string) (ok, found bool) {
 	defer f.mu.Unlock()
 	ok, found = f.acks[remoteID]
 	return
+}
+
+// reactingBackend adds the optional read-reaction capability on top of a
+// fakeBackend. fakeBackend itself does not implement it, so existing tests
+// do not start background reactions.
+type readCall struct {
+	remoteID string
+	emoji    string
+	err      error
+}
+
+type reactingBackend struct {
+	*fakeBackend
+	emoji string
+	fn    func(ctx context.Context, remoteID, emoji string) error
+	mu    sync.Mutex
+	calls []readCall
+}
+
+func (r *reactingBackend) ReadEmoji() string { return r.emoji }
+
+func (r *reactingBackend) React(ctx context.Context, remoteID, emoji string) error {
+	var err error
+	if r.fn != nil {
+		err = r.fn(ctx, remoteID, emoji)
+	}
+	r.mu.Lock()
+	r.calls = append(r.calls, readCall{remoteID, emoji, err})
+	r.mu.Unlock()
+	return err
+}
+
+func (r *reactingBackend) snapshot() []readCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]readCall(nil), r.calls...)
+}
+
+func (r *reactingBackend) count(remoteID string) int {
+	n := 0
+	for _, c := range r.snapshot() {
+		if c.remoteID == remoteID {
+			n++
+		}
+	}
+	return n
+}
+
+func (e *env) enableReadReactions(t *testing.T, emoji string, fn func(context.Context, string, string) error) *reactingBackend {
+	t.Helper()
+	rb := &reactingBackend{fakeBackend: e.backend, emoji: emoji, fn: fn}
+	var err error
+	e.bridge, err = livechat.New(livechat.Config{
+		Store:   e.store,
+		Blobs:   e.blobs,
+		Backend: rb,
+		OnAgentMessage: func(_ context.Context, userID string, m *livechat.Message, online bool) {
+			e.hookMu.Lock()
+			defer e.hookMu.Unlock()
+			e.hooks = append(e.hooks, hookCall{userID, m, online})
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rb
+}
+
+func waitUntil(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("condition not met before timeout")
+}
+
+func (e *env) agent(t *testing.T, remote, text string) {
+	t.Helper()
+	err := e.bridge.HandleAgentMessage(context.Background(), livechat.AgentMessage{
+		RemoteID:      remote,
+		RootMessageID: "om_root_1",
+		ThreadID:      "omt_1",
+		AgentID:       "ou_agent",
+		Parts:         []livechat.Part{{Text: text}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func messageIDByRemote(t *testing.T, e *env, remote string) string {
+	t.Helper()
+	msgs, _, err := e.bridge.History(context.Background(), "alice", livechat.Query{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range msgs {
+		if m.RemoteID == remote {
+			return m.ID
+		}
+	}
+	t.Fatalf("no message with remote id %s", remote)
+	return ""
 }
 
 type memBlobs struct {
@@ -463,5 +574,307 @@ func TestUnavailableBackendRefusesMessages(t *testing.T) {
 	}
 	if msgs, _, _ := e.bridge.History(context.Background(), "alice", livechat.Query{}); len(msgs) != 0 {
 		t.Fatal("a refused message must not be stored")
+	}
+}
+
+func TestReadReactionOnNewlyReadAgentMessages(t *testing.T) {
+	e := newEnv(t)
+	rb := e.enableReadReactions(t, "Get", nil)
+	ctx := context.Background()
+	if _, err := e.bridge.SendText(ctx, alice, "hi"); err != nil {
+		t.Fatal(err)
+	}
+	e.agent(t, "om_a", "a")
+	e.agent(t, "om_b", "b")
+	if err := e.bridge.HandleRecall(ctx, "om_b"); err != nil {
+		t.Fatal(err)
+	}
+	c := e.conv(t, "alice")
+	noRemote := &livechat.Message{
+		ID:             uuid.Must(uuid.NewV7()).String(),
+		ConversationID: c.ID,
+		Sender:         livechat.SenderAgent,
+		Blocks:         []livechat.Block{{Type: livechat.BlockText, Text: "local"}},
+		Status:         livechat.StatusSent,
+		CreatedAt:      time.Now().UTC(),
+	}
+	if _, err := e.store.InsertMessage(ctx, noRemote); err != nil {
+		t.Fatal(err)
+	}
+	e.agent(t, "om_c", "c")
+	e.agent(t, "om_d", "d")
+
+	if err := e.bridge.MarkRead(ctx, "alice", messageIDByRemote(t, e, "om_c")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return rb.count("om_a") == 1 && rb.count("om_c") == 1 })
+	if rb.count("om_b")+rb.count("om_d")+rb.count("") != 0 || len(rb.snapshot()) != 2 {
+		t.Fatalf("reactions = %+v", rb.snapshot())
+	}
+	for _, call := range rb.snapshot() {
+		if call.emoji != "Get" || call.err != nil {
+			t.Fatalf("reaction call: %+v", call)
+		}
+	}
+	if ok, found := e.backend.ack("om_a"); !found || !ok {
+		t.Fatal("delivery ack DONE is independent of the read reaction")
+	}
+
+	if err := e.bridge.MarkRead(ctx, "alice", messageIDByRemote(t, e, "om_d")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return rb.count("om_d") == 1 })
+	if rb.count("om_a") != 1 || rb.count("om_c") != 1 || len(rb.snapshot()) != 3 {
+		t.Fatalf("already-read messages were reacted again: %+v", rb.snapshot())
+	}
+}
+
+func TestReadReactionDoesNotBackfill(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	if _, err := e.bridge.SendText(ctx, alice, "hi"); err != nil {
+		t.Fatal(err)
+	}
+	e.agent(t, "om_old", "old")
+	if err := e.bridge.MarkRead(ctx, "alice", messageIDByRemote(t, e, "om_old")); err != nil {
+		t.Fatal(err)
+	}
+	rb := e.enableReadReactions(t, "OK", nil)
+	e.agent(t, "om_new", "new")
+	if err := e.bridge.MarkRead(ctx, "alice", messageIDByRemote(t, e, "om_new")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return rb.count("om_new") == 1 })
+	if rb.count("om_old") != 0 || rb.snapshot()[0].emoji != "OK" {
+		t.Fatalf("reactions = %+v", rb.snapshot())
+	}
+}
+
+func TestEmptyReadEmojiSkipsReaction(t *testing.T) {
+	e := newEnv(t)
+	rb := e.enableReadReactions(t, "", nil)
+	ctx := context.Background()
+	if _, err := e.bridge.SendText(ctx, alice, "hi"); err != nil {
+		t.Fatal(err)
+	}
+	e.agent(t, "om_a", "a")
+	if err := e.bridge.MarkRead(ctx, "alice", messageIDByRemote(t, e, "om_a")); err != nil {
+		t.Fatal(err)
+	}
+	if len(rb.snapshot()) != 0 {
+		t.Fatalf("empty ReadEmoji still reacted: %+v", rb.snapshot())
+	}
+}
+
+func TestReadReactionRetriesTemporaryFailure(t *testing.T) {
+	e := newEnv(t)
+	var mu sync.Mutex
+	fails := map[string]int{}
+	rb := e.enableReadReactions(t, "Get", func(_ context.Context, remoteID, _ string) error {
+		mu.Lock()
+		fails[remoteID]++
+		n := fails[remoteID]
+		mu.Unlock()
+		if remoteID == "om_a" && n == 1 {
+			return errors.New("feishu timeout")
+		}
+		return nil
+	})
+	ctx := context.Background()
+	if _, err := e.bridge.SendText(ctx, alice, "hi"); err != nil {
+		t.Fatal(err)
+	}
+	e.agent(t, "om_a", "a")
+	e.agent(t, "om_b", "b")
+	if err := e.bridge.MarkRead(ctx, "alice", messageIDByRemote(t, e, "om_b")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return rb.count("om_a") == 1 && rb.count("om_b") == 1 })
+	// The failed row is put back to 0 after React returns. Keep reading newer
+	// messages until that release is visible and om_a is claimed again.
+	deadline := time.Now().Add(5 * time.Second)
+	for rb.count("om_a") < 2 && time.Now().Before(deadline) {
+		remote := fmt.Sprintf("om_more_%d", time.Now().UnixNano())
+		e.agent(t, remote, remote)
+		if err := e.bridge.MarkRead(ctx, "alice", messageIDByRemote(t, e, remote)); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if rb.count("om_a") != 2 || rb.count("om_b") != 1 {
+		t.Fatalf("reactions = %+v", rb.snapshot())
+	}
+	var goneErr bool
+	for _, c := range rb.snapshot() {
+		if c.remoteID == "om_a" && c.err != nil {
+			goneErr = true
+		}
+	}
+	if !goneErr {
+		t.Fatal("the failed attempt was not recorded")
+	}
+}
+
+func TestReadReactionDoesNotRetryGoneMessage(t *testing.T) {
+	e := newEnv(t)
+	rb := e.enableReadReactions(t, "Get", func(_ context.Context, remoteID, _ string) error {
+		if remoteID == "om_gone" {
+			return fmt.Errorf("recalled: %w", livechat.ErrMessageGone)
+		}
+		return nil
+	})
+	ctx := context.Background()
+	if _, err := e.bridge.SendText(ctx, alice, "hi"); err != nil {
+		t.Fatal(err)
+	}
+	e.agent(t, "om_gone", "gone")
+	e.agent(t, "om_ok", "ok")
+	if err := e.bridge.MarkRead(ctx, "alice", messageIDByRemote(t, e, "om_ok")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return rb.count("om_gone") == 1 && rb.count("om_ok") == 1 })
+	e.agent(t, "om_next", "next")
+	if err := e.bridge.MarkRead(ctx, "alice", messageIDByRemote(t, e, "om_next")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return rb.count("om_next") == 1 })
+	if rb.count("om_gone") != 1 || rb.count("om_ok") != 1 {
+		t.Fatalf("gone message was retried: %+v", rb.snapshot())
+	}
+}
+
+func TestReadReactionRace(t *testing.T) {
+	e := newEnv(t)
+	rb := e.enableReadReactions(t, "Get", nil)
+	ctx := context.Background()
+	if _, err := e.bridge.SendText(ctx, alice, "hi"); err != nil {
+		t.Fatal(err)
+	}
+	var remotes []string
+	for i := 0; i < 5; i++ {
+		remote := fmt.Sprintf("om_race_%d", i)
+		remotes = append(remotes, remote)
+		e.agent(t, remote, remote)
+	}
+	last := messageIDByRemote(t, e, remotes[len(remotes)-1])
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := e.bridge.MarkRead(ctx, "alice", last); err != nil {
+				t.Errorf("MarkRead: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	var lastN int
+	var stableSince time.Time
+	waitUntil(t, func() bool {
+		n := len(rb.snapshot())
+		if n != lastN {
+			lastN = n
+			stableSince = time.Now()
+			return false
+		}
+		return n == len(remotes) && time.Since(stableSince) > 50*time.Millisecond
+	})
+	if len(rb.snapshot()) != len(remotes) {
+		t.Fatalf("reactions = %+v", rb.snapshot())
+	}
+	for _, remote := range remotes {
+		if rb.count(remote) != 1 {
+			t.Fatalf("remote %s claimed %d times: %+v", remote, rb.count(remote), rb.snapshot())
+		}
+	}
+}
+
+func TestMarkReadDoesNotBlockOnReaction(t *testing.T) {
+	e := newEnv(t)
+	release := make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	rb := e.enableReadReactions(t, "Get", func(ctx context.Context, _, _ string) error {
+		<-release
+		return ctx.Err()
+	})
+	ctx := context.Background()
+	if _, err := e.bridge.SendText(ctx, alice, "hi"); err != nil {
+		t.Fatal(err)
+	}
+	e.agent(t, "om_a", "a")
+	id := messageIDByRemote(t, e, "om_a")
+
+	done := make(chan error, 1)
+	go func() {
+		done <- e.bridge.MarkRead(ctx, "alice", id)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("MarkRead blocked on the reaction")
+	}
+	once.Do(func() { close(release) })
+	waitUntil(t, func() bool {
+		calls := rb.snapshot()
+		return len(calls) == 1 && calls[0].err == nil
+	})
+}
+
+func TestHTTPReadDoesNotWaitForReaction(t *testing.T) {
+	e := newEnv(t)
+	release := make(chan struct{})
+	var once sync.Once
+	rb := e.enableReadReactions(t, "Get", func(ctx context.Context, _, _ string) error {
+		<-release
+		return ctx.Err()
+	})
+	ctx := context.Background()
+	if _, err := e.bridge.SendText(ctx, alice, "hi"); err != nil {
+		t.Fatal(err)
+	}
+	e.agent(t, "om_a", "a")
+	id := messageIDByRemote(t, e, "om_a")
+
+	h := e.bridge.Handler(livechat.HandlerOptions{
+		Authenticate: func(r *http.Request) (livechat.User, error) {
+			return alice, nil
+		},
+	})
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/read", strings.NewReader(`{"message_id":"`+id+`"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("POST /read blocked or failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	once.Do(func() { close(release) })
+	waitUntil(t, func() bool {
+		calls := rb.snapshot()
+		return len(calls) == 1 && calls[0].err == nil && calls[0].remoteID == "om_a"
+	})
+
+	// The request context was canceled when the handler returned. The reaction
+	// still stuck, so a later read does not send it again.
+	e.agent(t, "om_b", "b")
+	if err := e.bridge.MarkRead(ctx, "alice", messageIDByRemote(t, e, "om_b")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return rb.count("om_b") == 1 })
+	if rb.count("om_a") != 1 {
+		t.Fatalf("canceled request context dropped the reaction: %+v", rb.snapshot())
 	}
 }

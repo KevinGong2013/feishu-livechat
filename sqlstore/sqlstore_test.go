@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -213,19 +214,29 @@ func testUnread(t *testing.T, s *sqlstore.Store) {
 	if n := count(); n != 2 {
 		t.Fatalf("recalled replies are not unread: got %d", n)
 	}
-	_ = s.MarkRead(ctx, c.ID, u1.ID)
+	advanced, old, err := s.MarkRead(ctx, c.ID, u1.ID)
+	if err != nil || !advanced || old != "" {
+		t.Fatalf("MarkRead u1: advanced=%v old=%q err=%v", advanced, old, err)
+	}
 	if n := count(); n != 1 {
 		t.Fatalf("unread after reading up to u1 = %d, want 1", n)
 	}
-	_ = s.MarkRead(ctx, c.ID, a1.ID) // backwards: ignored
+	if advanced, _, err = s.MarkRead(ctx, c.ID, a1.ID); err != nil || advanced { // backwards: ignored
+		t.Fatalf("read pointer moved backwards: advanced=%v err=%v", advanced, err)
+	}
 	if n := count(); n != 1 {
 		t.Fatalf("read pointer moved backwards: %d", n)
 	}
-	_ = s.MarkRead(ctx, c.ID, foreign.ID) // another conversation's message: ignored
+	if advanced, _, err = s.MarkRead(ctx, c.ID, foreign.ID); err != nil || advanced { // another conversation's message: ignored
+		t.Fatalf("read pointer accepted a foreign message: advanced=%v err=%v", advanced, err)
+	}
 	if n := count(); n != 1 {
 		t.Fatalf("read pointer accepted a foreign message: %d", n)
 	}
-	_ = s.MarkRead(ctx, c.ID, a3.ID)
+	advanced, old, err = s.MarkRead(ctx, c.ID, a3.ID)
+	if err != nil || !advanced || old != u1.ID {
+		t.Fatalf("MarkRead a3: advanced=%v old=%q want %q err=%v", advanced, old, u1.ID, err)
+	}
 	if n := count(); n != 0 {
 		t.Fatalf("unread after reading all = %d", n)
 	}
@@ -291,5 +302,176 @@ func TestAgentNumber(t *testing.T) {
 				t.Fatalf("unknown agent name = %q", got)
 			}
 		})
+	}
+}
+
+func setOf(ids []string) map[string]bool {
+	out := map[string]bool{}
+	for _, id := range ids {
+		out[id] = true
+	}
+	return out
+}
+
+func sameSet(got []string, want ...string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	g := setOf(got)
+	for _, id := range want {
+		if !g[id] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestClaimReadReactions(t *testing.T) {
+	ctx := context.Background()
+	for name, s := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			c, _ := s.EnsureConversation(ctx, "user-r", "R")
+			other, _ := s.EnsureConversation(ctx, "user-o", "O")
+
+			a1 := msg(c.ID, livechat.SenderAgent, "om_a1")
+			user := msg(c.ID, livechat.SenderUser, "om_user")
+			recalled := msg(c.ID, livechat.SenderAgent, "om_recalled")
+			noRemote := msg(c.ID, livechat.SenderAgent, "")
+			a2 := msg(c.ID, livechat.SenderAgent, "om_a2")
+			a3 := msg(c.ID, livechat.SenderAgent, "om_a3")
+			foreign := msg(other.ID, livechat.SenderAgent, "om_foreign")
+			for _, m := range []*livechat.Message{a1, user, recalled, noRemote, a2, a3, foreign} {
+				if _, err := s.InsertMessage(ctx, m); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := s.RecallMessage(ctx, "om_recalled"); err != nil {
+				t.Fatal(err)
+			}
+
+			// Already-read history (at or below the first floor) is not claimed.
+			got, err := s.ClaimReadReactions(ctx, c.ID, a1.ID, a2.ID)
+			if err != nil || !sameSet(got, "om_a2") {
+				t.Fatalf("first claim = %v, %v; want om_a2", got, err)
+			}
+			got, err = s.ClaimReadReactions(ctx, c.ID, a1.ID, a2.ID)
+			if err != nil || len(got) != 0 {
+				t.Fatalf("second claim of the same window = %v, %v", got, err)
+			}
+
+			// A released row is claimed again by a later read, together with
+			// the new window. The user message, the recalled reply, the reply
+			// with no remote id, and the other conversation stay out.
+			if err := s.ReleaseReadReactions(ctx, []string{"om_a2"}); err != nil {
+				t.Fatal(err)
+			}
+			got, err = s.ClaimReadReactions(ctx, c.ID, a2.ID, a3.ID)
+			if err != nil || !sameSet(got, "om_a2", "om_a3") {
+				t.Fatalf("retry claim = %v, %v; want om_a2 and om_a3", got, err)
+			}
+			if got, err = s.ClaimReadReactions(ctx, other.ID, "", foreign.ID); err != nil || !sameSet(got, "om_foreign") {
+				t.Fatalf("other conversation = %v, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestClaimReadReactionsRace(t *testing.T) {
+	ctx := context.Background()
+	for name, s := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			c, _ := s.EnsureConversation(ctx, "user-race", "R")
+			var want []string
+			var last string
+			for i := 0; i < 8; i++ {
+				m := msg(c.ID, livechat.SenderAgent, fmt.Sprintf("om_race_%d", i))
+				if _, err := s.InsertMessage(ctx, m); err != nil {
+					t.Fatal(err)
+				}
+				want = append(want, m.RemoteID)
+				last = m.ID
+			}
+			const n = 12
+			var wg sync.WaitGroup
+			var mu sync.Mutex
+			got := map[string]int{}
+			errs := make(chan error, n)
+			for i := 0; i < n; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					ids, err := s.ClaimReadReactions(ctx, c.ID, "", last)
+					if err != nil {
+						errs <- err
+						return
+					}
+					mu.Lock()
+					for _, id := range ids {
+						got[id]++
+					}
+					mu.Unlock()
+				}()
+			}
+			wg.Wait()
+			close(errs)
+			for err := range errs {
+				t.Errorf("claim: %v", err)
+			}
+			if len(got) != len(want) {
+				t.Fatalf("claimed %d ids, want %d (%v)", len(got), len(want), got)
+			}
+			for _, id := range want {
+				if got[id] != 1 {
+					t.Fatalf("remote %s claimed %d times", id, got[id])
+				}
+			}
+		})
+	}
+}
+
+func TestReadReactedColumnAlreadyExists(t *testing.T) {
+	ctx := context.Background()
+	check := func(t *testing.T, db *sql.DB, s *sqlstore.Store) {
+		t.Helper()
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatal(err)
+		}
+		// The column is already there (a host migration such as apkgo-cloud
+		// 062 added it) but this library has not recorded version 2.
+		if _, err := db.ExecContext(ctx, `DELETE FROM livechat_schema_migrations WHERE version = 2`); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatalf("migrate with the column already present: %v", err)
+		}
+		var n int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM livechat_schema_migrations WHERE version = 2`).Scan(&n); err != nil || n != 1 {
+			t.Fatalf("version 2 recorded = %d, %v", n, err)
+		}
+		var flag int
+		if err := db.QueryRowContext(ctx, `SELECT read_reacted FROM livechat_messages LIMIT 1`).Scan(&flag); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("read_reacted column: %v", err)
+		}
+	}
+
+	db, err := sqlstore.OpenSQLite(filepath.Join(t.TempDir(), "livechat.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	check(t, db, sqlstore.New(db, sqlstore.SQLite))
+
+	if dsn := os.Getenv("LIVECHAT_TEST_POSTGRES_URL"); dsn != "" {
+		pg, err := sql.Open("pgx", dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { pg.Close() })
+		for _, tbl := range []string{"livechat_messages", "livechat_conversations", "livechat_settings", "livechat_schema_migrations"} {
+			if _, err := pg.Exec("DROP TABLE IF EXISTS " + tbl + " CASCADE"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		check(t, pg, sqlstore.New(pg, sqlstore.Postgres))
 	}
 }

@@ -45,6 +45,10 @@ type Config struct {
 	// "DONE" and "CrossMark".
 	DeliveredEmoji string
 	FailedEmoji    string
+	// ReadEmoji is the extra reaction put on an agent's reply once the web
+	// user has read it. Default "Get". Empty means Get; it does not disable
+	// the reaction. DeliveredEmoji is unchanged.
+	ReadEmoji string
 	// MaxImageBytes caps images downloaded from agents. Default 20 MiB.
 	MaxImageBytes int64
 	Logger        *slog.Logger
@@ -63,6 +67,7 @@ type Client struct {
 }
 
 var _ livechat.Backend = (*Client)(nil)
+var _ livechat.Reactor = (*Client)(nil)
 
 // New returns a Client. Call Init (or Listen, which calls it) before
 // handling events.
@@ -78,6 +83,9 @@ func New(cfg Config) (*Client, error) {
 	}
 	if cfg.FailedEmoji == "" {
 		cfg.FailedEmoji = "CrossMark"
+	}
+	if cfg.ReadEmoji == "" {
+		cfg.ReadEmoji = "Get"
 	}
 	if cfg.MaxImageBytes <= 0 {
 		cfg.MaxImageBytes = 20 << 20
@@ -254,11 +262,12 @@ func (c *Client) FetchImage(ctx context.Context, remoteID, imageKey string) ([]b
 	return data, nil
 }
 
-func (c *Client) Ack(ctx context.Context, remoteID string, ok bool) error {
-	emoji := c.cfg.DeliveredEmoji
-	if !ok {
-		emoji = c.cfg.FailedEmoji
-	}
+// ReadEmoji is the reaction added when the user has read an agent's reply.
+func (c *Client) ReadEmoji() string { return c.cfg.ReadEmoji }
+
+// React adds one emoji reaction to a message. Ack uses it for the delivery
+// receipt; read receipts use it with ReadEmoji.
+func (c *Client) React(ctx context.Context, remoteID, emoji string) error {
 	resp, err := c.api.Im.MessageReaction.Create(ctx, larkim.NewCreateMessageReactionReqBuilder().
 		MessageId(remoteID).
 		Body(larkim.NewCreateMessageReactionReqBodyBuilder().
@@ -269,9 +278,22 @@ func (c *Client) Ack(ctx context.Context, remoteID string, ok bool) error {
 		return err
 	}
 	if !resp.Success() {
+		// 231003: message id is wrong, or the message was recalled or deleted.
+		// 230110: the message was deleted. Neither can succeed later.
+		if resp.CodeError.Code == 231003 || resp.CodeError.Code == 230110 {
+			return fmt.Errorf("feishu: add reaction %s: %s (code %d): %w", emoji, resp.CodeError.Msg, resp.CodeError.Code, livechat.ErrMessageGone)
+		}
 		return apiErr("add reaction "+emoji, resp.CodeError)
 	}
 	return nil
+}
+
+func (c *Client) Ack(ctx context.Context, remoteID string, ok bool) error {
+	emoji := c.cfg.DeliveredEmoji
+	if !ok {
+		emoji = c.cfg.FailedEmoji
+	}
+	return c.React(ctx, remoteID, emoji)
 }
 
 func deref(s *string) string {
